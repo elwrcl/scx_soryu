@@ -1,0 +1,6 @@
+/target/
+/result
+/result-*
+src/bpf/vmlinux.h
+/nixos.qcow2
+/Cargo.lock.orig
