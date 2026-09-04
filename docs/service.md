@@ -23,8 +23,9 @@ services.scx-soryu = {
 };
 ```
 
-that's it. the defaults are measured values: `sliceUs = 1000`
-([`slice.md`](slice.md)), `starveMs = 128` ([`stage6-starve.md`](stage6-starve.md)),
+that's it. the defaults are measured values: `sliceUs = 1000` (the same
+compile took 4m49s at 4194 and 4m39s at both 1000 and 500), `starveMs = 128`,
+`boostOnWake = false` ([`boost-on-wake.md`](boost-on-wake.md)),
 `timeoutMs = 5000`, `reportSec = 60`.
 
 to turn it off: `services.scx-soryu.enable = false;` or
@@ -75,7 +76,8 @@ sudo scx_soryu --monitor 3
 ## verified in a VM
 
 `nixosConfigurations.servicevm` — the same test VM, but running the
-scheduler as a service instead of by hand. `tools/servicevm.sh`:
+scheduler as a service instead of by hand. the checks that were run against
+it:
 
 | check | result |
 | --- | --- |
