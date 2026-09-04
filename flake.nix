@@ -188,8 +188,23 @@ MSG
               type = lib.types.ints.positive;
               default = 1000;
               description = ''
-                Timeslice in microseconds. 1000 is the measured knee: see
-                docs/slice.md. 4194 restores BMQ's own value.
+                Timeslice in microseconds. 1000 is the measured knee: the
+                same compile took 4m49s at 4194 and 4m39s at both 1000 and
+                500. 4194 restores BMQ's own value.
+              '';
+            };
+
+            boostOnWake = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = ''
+                Boost a waking task in proportion to how long it slept.
+
+                BMQ means to do this but ships the line as a comparison rather
+                than a subtraction, so in practice it never happens. Measured
+                both ways: off halves the interactive tail past 1 ms, in 63 of
+                68 paired intervals, at no cost in compile time. See
+                docs/boost-on-wake.md. true restores the intended behaviour.
               '';
             };
 
@@ -220,7 +235,7 @@ MSG
             extraArgs = lib.mkOption {
               type = lib.types.listOf lib.types.str;
               default = [ ];
-              example = [ "--boost-on-wake" "false" ];
+              example = [ "--debug" ];
             };
 
             notify = {
@@ -267,6 +282,7 @@ MSG
                   (lib.getExe cfg.package)
                   "--slice-us" (toString cfg.sliceUs)
                   "--starve-ms" (toString cfg.starveMs)
+                  "--boost-on-wake" (lib.boolToString cfg.boostOnWake)
                   "--timeout-ms" (toString cfg.timeoutMs)
                   "--report-sec" (toString cfg.reportSec)
                 ] ++ cfg.extraArgs);
