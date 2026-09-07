@@ -1,0 +1,70 @@
+# Linux kernel style, matching src/bpf/main.bpf.c as written.
+#
+# Without this file clangd falls back to LLVM style (2-space indent, braces on
+# the same line) and editor.formatOnSave rewrites the whole file on first save.
+# Derived from the kernel tree's own .clang-format, trimmed to what this
+# single-file BPF source actually needs.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Indentation: hard tabs, 8 wide, as in the kernel.
+UseTab: Always
+TabWidth: 8
+IndentWidth: 8
+ContinuationIndentWidth: 8
+ConstructorInitializerIndentWidth: 8
+
+ColumnLimit: 0
+
+# Kernel brace placement: functions get a brace on the next line, everything
+# else keeps it on the same line.
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterStruct: true
+  AfterUnion: true
+  AfterEnum: true
+  AfterControlStatement: Never
+  BeforeElse: false
+  BeforeWhile: false
+
+AlignEscapedNewlines: Left
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AlwaysBreakBeforeMultilineStrings: false
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: false
+Cpp11BracedListStyle: false
+IndentCaseLabels: false
+IndentGotoLabels: false
+IndentPPDirectives: None
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInCStyleCastParentheses: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SortIncludes: Never
+ReflowComments: false
+
+# BPF/kernel macros that take a block or act as control flow; without these
+# clang-format indents the bodies as if they were expressions.
+ForEachMacros:
+  - bpf_for
+  - bpf_for_each
+  - bpf_repeat
+  - list_for_each_entry
+  - list_for_each_entry_safe
+
+AlignTrailingComments: true
+AlignConsecutiveMacros: false

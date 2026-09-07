@@ -1,0 +1,13 @@
+{
+  // main.bpf.c is hand-formatted kernel style with tab-aligned trailing
+  // comments, which clang-format cannot reproduce. The global
+  // editor.formatOnSave would rewrite ~200 lines on every save, so it is off
+  // for C here. .clang-format still exists for deliberate formatting of new
+  // code (right-click -> Format Selection).
+  "[c]": {
+    "editor.formatOnSave": false
+  },
+  "[cpp]": {
+    "editor.formatOnSave": false
+  }
+}

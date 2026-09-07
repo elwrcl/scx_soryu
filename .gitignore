@@ -4,3 +4,6 @@
 src/bpf/vmlinux.h
 /nixos.qcow2
 /Cargo.lock.orig
+/compile_commands.json
+/.direnv/
+/.cache/
