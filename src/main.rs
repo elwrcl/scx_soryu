@@ -81,6 +81,8 @@ soryu_stats!(
     starve_blocked,
     bitmap_repair,
     wake_donate,
+    gpu_submit,
+    gpu_cap,
 );
 
 /// mirrors BOOST_RANGE in main.bpf.c.
@@ -96,6 +98,19 @@ const LAT_OCTAVES: usize = 32;
 const LAT_SUBS: usize = 4;
 const LAT_BUCKETS: usize = LAT_OCTAVES * LAT_SUBS;
 const LAT_CLASS_NAMES: [&str; LAT_CLASSES] = ["boosted", "neutral", "deboosted"];
+
+/// mirrors GPU_POPS in main.bpf.c.
+const GPU_POPS: usize = 3;
+const GPU_POP_NAMES: [&str; GPU_POPS] = [
+    "gpu-feeder",
+    "gpu-requeue boosted",
+    "gpu-requeue deboosted",
+];
+
+/// Module BTF the i915 tracepoints resolve against. Absent means no i915 --
+/// the test VM, or an AMD machine -- and those programs must not be loaded,
+/// or the whole object fails with them.
+const I915_BTF: &str = "/sys/kernel/btf/i915";
 
 /// Lower edge of bucket @i in ns: mantissa (4 + sub) / 4, scaled by 2^octave.
 /// Inverse of lat_bucket() in main.bpf.c.
@@ -178,6 +193,14 @@ struct Opts {
     #[arg(long, default_value_t = false, env = "SORYU_VTIME_WITHIN_LEVEL",
           action = clap::ArgAction::Set)]
     vtime_within_level: bool,
+
+    /// Boost a recent GPU feeder may not be deboosted past, in [-12, 12].
+    /// The default -1 keeps feeders in the boosted class; 12 turns it off.
+    /// Measured in docs/gpu-feeder.md.
+    #[arg(long, default_value_t = -1, env = "SORYU_GPU_BOOST_CAP",
+          value_parser = clap::value_parser!(i32).range(-12..=12))]
+    gpu_boost_cap: i32,
+
     #[arg(long, default_value_t = 1, env = "SORYU_REPORT_SEC")]
     report_sec: u64,
     #[arg(long, env = "SORYU_LOG")]
@@ -221,6 +244,32 @@ fn percentiles(buckets: &[u64]) -> Option<(u64, u64, u64)> {
     Some((at(0.50), at(0.99), at(0.999)))
 }
 
+/// Mean and occupied-bucket distribution of a boost histogram, None if empty.
+fn boost_summary(hist: &[u64]) -> Option<(f64, String)> {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return None;
+    }
+
+    let occupied: Vec<String> = hist
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(i, &c)| {
+            let b = i as i32 - BOOST_RANGE;
+            format!("{b:+}:{:.1}%", 100.0 * c as f64 / total as f64)
+        })
+        .collect();
+
+    let weighted: i64 = hist
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (i as i64 - BOOST_RANGE as i64) * c as i64)
+        .sum();
+
+    Some((weighted as f64 / total as f64, occupied.join(" ")))
+}
+
 struct Scheduler<'a> {
     opts: Opts,
     skel: BpfSkel<'a>,
@@ -243,6 +292,8 @@ struct Scheduler<'a> {
     prev_ule: Vec<u64>,
     prev_bounce: Vec<u64>,
     prev_release: Vec<u64>,
+    prev_gpu_lat: Vec<u64>,
+    prev_gpu_boost: Vec<u64>,
 
     /// Separate snapshots for the stats server: it samples on its own schedule
     /// and must not consume the report's intervals, or vice versa.
@@ -281,8 +332,15 @@ impl<'a> Scheduler<'a> {
         rodata.cgrp_weight_levels = opts.cgrp_weight_levels;
         rodata.wake_donate = opts.wake_donate;
         rodata.vtime_within_level = opts.vtime_within_level;
+        rodata.gpu_boost_cap = opts.gpu_boost_cap;
 
         rodata.slice_ns = opts.slice_us * 1_000;
+
+        let have_i915 = std::path::Path::new(I915_BTF).exists();
+        if !have_i915 {
+            skel.progs.soryu_i915_request_add.set_autoload(false);
+            info!("no {I915_BTF}: no GPU feeders, gpu_boost_cap has nothing to act on");
+        }
 
         let mut skel = scx_ops_load!(skel, soryu_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, soryu_ops)?);
@@ -291,7 +349,7 @@ impl<'a> Scheduler<'a> {
         info!(
             "{} attached: {} CPUs, slice {} us, boost_on_wake={}, \
              starve {} ms, clear_bitmap={}, ule_weight={} (window {} ms), \
-             vtime_within_level={}, timeout {} ms",
+             vtime_within_level={}, gpu_boost_cap={}, timeout {} ms",
             SCHEDULER_NAME,
             *scx_utils::NR_CPU_IDS,
             rd.slice_ns / 1000,
@@ -301,6 +359,7 @@ impl<'a> Scheduler<'a> {
             rd.ule_weight,
             rd.ule_window_ns / 1_000_000,
             rd.vtime_within_level,
+            rd.gpu_boost_cap,
             opts.timeout_ms
         );
 
@@ -317,6 +376,8 @@ impl<'a> Scheduler<'a> {
             prev_ule: Vec::new(),
             prev_bounce: Vec::new(),
             prev_release: Vec::new(),
+            prev_gpu_lat: Vec::new(),
+            prev_gpu_boost: Vec::new(),
             stats_prev_lat: Vec::new(),
         })
     }
@@ -379,6 +440,8 @@ impl<'a> Scheduler<'a> {
             starve_blocked: g(stat::starve_blocked),
             bitmap_repair: g(stat::bitmap_repair),
             wake_donate: g(stat::wake_donate),
+            gpu_submit: g(stat::gpu_submit),
+            gpu_cap: g(stat::gpu_cap),
             ..Default::default()
         };
 
@@ -485,39 +548,33 @@ impl<'a> Scheduler<'a> {
         let ule_cur = bss.ule_hist.to_vec();
         let bounce_cur = bss.bounce_hist.to_vec();
         let release_cur = bss.release_reason.to_vec();
+        let gpu_lat_cur = bss.gpu_lat_hist.to_vec();
+        let gpu_boost_cur = bss.gpu_boost_hist.to_vec();
 
         let boost = hist_delta(&boost_cur, &self.prev_boost);
         let lat = hist_delta(&lat_cur, &self.prev_lat);
         let ule = hist_delta(&ule_cur, &self.prev_ule);
         let bounce = hist_delta(&bounce_cur, &self.prev_bounce);
         let release = hist_delta(&release_cur, &self.prev_release);
+        let gpu_lat = hist_delta(&gpu_lat_cur, &self.prev_gpu_lat);
+        let gpu_boost = hist_delta(&gpu_boost_cur, &self.prev_gpu_boost);
 
         self.prev_boost = boost_cur;
         self.prev_lat = lat_cur;
         self.prev_ule = ule_cur;
         self.prev_bounce = bounce_cur;
         self.prev_release = release_cur;
+        self.prev_gpu_lat = gpu_lat_cur;
+        self.prev_gpu_boost = gpu_boost_cur;
 
-        let total: u64 = boost.iter().sum();
-        if total > 0 {
-            let occupied: Vec<String> = boost
-                .iter()
-                .enumerate()
-                .filter(|(_, &c)| c > 0)
-                .map(|(i, &c)| {
-                    let b = i as i32 - BOOST_RANGE;
-                    format!("{b:+}:{:.1}%", 100.0 * c as f64 / total as f64)
-                })
-                .collect();
+        if let Some((mean, dist)) = boost_summary(&boost) {
+            info!("  boost mean={mean:+.2} dist: {dist}");
+        }
 
-            let weighted: i64 = boost
-                .iter()
-                .enumerate()
-                .map(|(i, &c)| (i as i64 - BOOST_RANGE as i64) * c as i64)
-                .sum();
-            let mean = weighted as f64 / total as f64;
-
-            info!("  boost mean={mean:+.2} dist: {}", occupied.join(" "));
+        // Same shape as the line above, so the two read side by side: if
+        // feeders sit on the floor like everyone else, boost already has them.
+        if let Some((mean, dist)) = boost_summary(&gpu_boost) {
+            info!("  gpu-feeder boost mean={mean:+.2} dist: {dist}");
         }
 
         let step = ULE_MAX / ULE_BUCKETS;
@@ -569,6 +626,24 @@ impl<'a> Scheduler<'a> {
             info!(
                 "  wake->run {}: p50={} p99={} p99.9={} n={}",
                 LAT_CLASS_NAMES[c],
+                fmt_ns(p50),
+                fmt_ns(p99),
+                fmt_ns(p999),
+                slice.iter().sum::<u64>()
+            );
+        }
+
+        // Subsets of the lines above, cut by what the task was doing with the
+        // GPU rather than by its boost.
+        for (p, name) in GPU_POP_NAMES.iter().enumerate() {
+            let slice = &gpu_lat[p * LAT_BUCKETS..(p + 1) * LAT_BUCKETS];
+            let Some((p50, p99, p999)) = percentiles(slice) else {
+                continue;
+            };
+
+            info!(
+                "  wake->run {}: p50={} p99={} p99.9={} n={}",
+                name,
                 fmt_ns(p50),
                 fmt_ns(p99),
                 fmt_ns(p999),

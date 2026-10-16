@@ -64,6 +64,11 @@ pub struct Metrics {
     #[stat(desc = "Wakeups where the waker handed the wakee some of its boost")]
     pub wake_donate: u64,
 
+    #[stat(desc = "GPU submissions (i915_request_add) by scx tasks")]
+    pub gpu_submit: u64,
+    #[stat(desc = "Deboosts skipped because the task is a recent GPU feeder")]
+    pub gpu_cap: u64,
+
     #[stat(desc = "Mean boost, x100 (negative is more interactive)")]
     pub boost_mean_x100: i64,
     #[stat(desc = "Percent of scheduling events at the -12 boost floor")]
@@ -172,6 +177,11 @@ impl Metrics {
             self.starve_blocked,
         )?;
         writeln!(w, "donate     wake_donate {}", self.wake_donate)?;
+        writeln!(
+            w,
+            "gpu        submit {}  cap {}",
+            self.gpu_submit, self.gpu_cap,
+        )?;
         Ok(())
     }
 
@@ -203,6 +213,8 @@ impl Metrics {
             starve_blocked: self.starve_blocked.saturating_sub(rhs.starve_blocked),
             bitmap_repair: self.bitmap_repair.saturating_sub(rhs.bitmap_repair),
             wake_donate: self.wake_donate.saturating_sub(rhs.wake_donate),
+            gpu_submit: self.gpu_submit.saturating_sub(rhs.gpu_submit),
+            gpu_cap: self.gpu_cap.saturating_sub(rhs.gpu_cap),
             // lat_boosted_* are already per-interval: the loader computes them
             // from a differenced histogram, since percentiles cannot be
             // subtracted. Differencing the count here too would zero it.

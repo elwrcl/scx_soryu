@@ -360,6 +360,75 @@ u64 bounce_hist[LAT_BUCKETS];
 u64 release_reason[RELEASE_REASONS];
 
 /*
+ * GPU feeders: tasks that submitted GPU work within the last GPU_FEEDER_NS,
+ * as seen by the i915_request_add hook at the bottom of this file.
+ *
+ * The thread that hands work to the GPU (a game's render thread, the
+ * compositor, Xwayland) is the one whose lateness costs a frame: if it runs
+ * late, the batch reaches the ring late, and on Gen7 there is no GPU-side
+ * scheduling to make that back up -- legacy ringbuffer submission, no
+ * preemption. Infinity v4.8 coupled CPU and GPU accounting for this reason.
+ *
+ * Three populations, all against lat_hist's buckets:
+ *
+ *   0  feeder: wake->run of a feeder
+ *   1  feeder requeue, boosted: stopped still runnable (slice end, kick,
+ *      bounce) with boost < 0, until it runs again
+ *   2  feeder requeue, not boosted: same, boost >= 0
+ *
+ * 1 and 2 are the population wake->run cannot see. A render thread that burns
+ * its slice mid-frame does not sleep, so it never passes ops.runnable and
+ * never gets a wake_at; the wait it pays to get the CPU back was invisible.
+ * The split is by boost at the moment it stopped, because the question was
+ * whether being deboosted is what makes that wait long. It was -- see
+ * gpu_boost_cap below and docs/gpu-feeder.md.
+ *
+ * Feeders waking out of a GPU wait were measured too, through the i915 and
+ * dma_fence wait tracepoints, and dropped: 1251 such wakeups in 20 minutes of
+ * play. Mesa's crocus does not block in the kernel for its fences, so there
+ * was no population there to schedule.
+ *
+ * 100 ms is three frames at 30 fps: generous on purpose, so the population is
+ * every thread that is plausibly feeding a frame and not only the ones caught
+ * mid-burst.
+ */
+#define GPU_FEEDER_NS (100ULL * 1000 * 1000)
+#define GPU_POPS 3
+
+/*
+ * A recent feeder is not deboosted past gpu_boost_cap. BOOST_RANGE (12) turns
+ * it off, since boost never exceeds it anyway.
+ *
+ * BMQ deboosts a render thread for doing exactly what a heavy frame needs,
+ * burning whole slices, and strict priority then queues it behind every
+ * better level. One 60 s camera pan in Half-Life 2, no background load: a
+ * feeder that stopped still runnable while boosted got the CPU back within
+ * 3.1 ms at p99.9 in every second of the run. Deboosted, it passed 4 ms in 6
+ * of 61 seconds and reached 25 ms -- two frames at 85 fps. -1 keeps feeders
+ * in the boosted class, where that wait never went long.
+ *
+ * Measured both ways, same binary, alternating (docs/gpu-feeder.md):
+ *
+ *   idle desktop, two rounds each   frames > 25 ms  26-27 -> 6-8
+ *                                   p99.9 frametime 44 ms -> 26 ms
+ *   under stress-ng --cpu 4         average fps     60.8 -> 73.3
+ *                                   1% low          30.0 -> 46.6
+ *
+ * The cost is that anything submitting to the GPU keeps its standing however
+ * much CPU it burns -- an OpenCL render included -- and outranks nice-0 hogs
+ * while it does. Measured: stress-ng lost 27% of its throughput to the game,
+ * at unchanged ops per CPU-second, so it ran less rather than slower, and the
+ * worst wait stayed at the starve_ns bound either way. That is the trade a
+ * desktop scheduler should make, so it is the default.
+ */
+const volatile s32 gpu_boost_cap = -1;
+
+u64 gpu_lat_hist[GPU_POPS * LAT_BUCKETS];
+
+/* boost_hist, restricted to feeders. */
+u64 gpu_boost_hist[2 * BOOST_RANGE + 1];
+
+/*
  * Bucket index for @ns: octave * LAT_SUBS + the two bits below the leading
  * one. Values under 4 ns have no mantissa bits to take and all land in
  * bucket 0, which is fine -- nothing real is measured there.
@@ -393,6 +462,9 @@ struct task_ctx
 	u64 bounce_at; /* scx_bpf_now() when ops.cpu_release threw it back */
 	s32 cgrp_adj;  /* cached level adjustment from cpu.weight */
 	u64 cgrp_seen; /* cgrp_gen this adjustment was computed against */
+	u64 gpu_submit_at; /* scx_bpf_now() at its last i915_request_add */
+	u64 requeue_at;	   /* scx_bpf_now() when a feeder stopped still runnable */
+	bool requeue_boosted; /* its boost was < 0 at that moment */
 };
 
 struct cgrp_ctx
@@ -445,6 +517,8 @@ enum soryu_stat_idx
 	SORYU_STAT_STARVE_BLOCKED,
 	SORYU_STAT_BITMAP_REPAIR,
 	SORYU_STAT_WAKE_DONATE,
+	SORYU_STAT_GPU_SUBMIT,
+	SORYU_STAT_GPU_CAP,
 	SORYU_NR_STATS,
 };
 
@@ -468,6 +542,16 @@ static void stat_inc(enum soryu_stat_idx idx)
 static struct task_ctx *lookup_task_ctx(struct task_struct *p)
 {
 	return bpf_task_storage_get(&task_ctxs, p, 0, 0);
+}
+
+/*
+ * Signed, so a submit stamped on another CPU a hair ahead of this one's clock
+ * still reads as recent rather than as 2^64 ns ago.
+ */
+static bool gpu_feeder(struct task_ctx *tctx, u64 now)
+{
+	return tctx->gpu_submit_at &&
+		   (s64)(now - tctx->gpu_submit_at) < (s64)GPU_FEEDER_NS;
 }
 
 /*
@@ -1221,9 +1305,15 @@ void BPF_STRUCT_OPS(soryu_running, struct task_struct *p)
 	if (tctx)
 	{
 		u32 idx = (u32)(tctx->boost + BOOST_RANGE);
+		u64 now = scx_bpf_now();
+		bool feeder = gpu_feeder(tctx, now);
 
 		if (idx < 2 * BOOST_RANGE + 1)
+		{
 			boost_hist[idx]++;
+			if (feeder)
+				gpu_boost_hist[idx]++;
+		}
 
 		/*
 		 * Clamp, do not drop. ule_score() returns a closed [0, 100],
@@ -1251,7 +1341,7 @@ void BPF_STRUCT_OPS(soryu_running, struct task_struct *p)
 		if (vtime_within_level && time_before(READ_ONCE(vtime_now), p->scx.dsq_vtime))
 			WRITE_ONCE(vtime_now, p->scx.dsq_vtime);
 
-		tctx->run_at = scx_bpf_now();
+		tctx->run_at = now;
 		tctx->slice_given = p->scx.slice;
 
 		if (tctx->wake_at)
@@ -1260,11 +1350,28 @@ void BPF_STRUCT_OPS(soryu_running, struct task_struct *p)
 						  ? tctx->run_at - tctx->wake_at
 						  : 0;
 			u32 cls = tctx->boost < 0 ? 0 : (tctx->boost ? 2 : 1);
-			u32 slot = cls * LAT_BUCKETS + lat_bucket(lat);
+			u32 b = lat_bucket(lat);
+			u32 slot = cls * LAT_BUCKETS + b;
 			if (slot < LAT_CLASSES * LAT_BUCKETS)
 				lat_hist[slot]++;
 
+			/* Every sample here is also in lat_hist above; this is a
+			 * subset of it, not a separate measurement. */
+			if (feeder && b < LAT_BUCKETS)
+				gpu_lat_hist[b]++;
+
 			tctx->wake_at = 0;
+		}
+
+		if (tctx->requeue_at)
+		{
+			u64 rl = now > tctx->requeue_at ? now - tctx->requeue_at : 0;
+			u32 pop = tctx->requeue_boosted ? 1 : 2;
+			u32 slot = pop * LAT_BUCKETS + lat_bucket(rl);
+
+			if (slot < GPU_POPS * LAT_BUCKETS)
+				gpu_lat_hist[slot]++;
+			tctx->requeue_at = 0;
 		}
 
 		/*
@@ -1332,11 +1439,24 @@ void BPF_STRUCT_OPS(soryu_stopping, struct task_struct *p, bool runnable)
 		return;
 	}
 
+	/* Boost as it was while running, before the deboost below can move it. */
+	if (gpu_feeder(tctx, now))
+	{
+		tctx->requeue_at = now;
+		tctx->requeue_boosted = tctx->boost < 0;
+	}
+
 	left = tctx->slice_given > ran ? tctx->slice_given - ran : 0;
 
 	if (left < RESCHED_NS)
 	{
-		deboost_task(p, tctx);
+		/* The first test keeps gpu_cap at zero when the knob is off,
+		 * rather than counting deboosts that were no-ops at +12. */
+		if (gpu_boost_cap < BOOST_RANGE && tctx->boost >= gpu_boost_cap &&
+			gpu_feeder(tctx, now))
+			stat_inc(SORYU_STAT_GPU_CAP);
+		else
+			deboost_task(p, tctx);
 		tctx->slice_left = 0;
 		stat_inc(SORYU_STAT_DEBOOST);
 	}
@@ -1384,6 +1504,9 @@ s32 BPF_STRUCT_OPS(soryu_init_task, struct task_struct *p,
 	tctx->bounce_at = 0;
 	tctx->cgrp_adj = 0;
 	tctx->cgrp_seen = 0; /* forces a refresh on the first enqueue */
+	tctx->gpu_submit_at = 0;
+	tctx->requeue_at = 0;
+	tctx->requeue_boosted = false;
 
 	/* Starting at 0 would read as an enormous credit against vtime_now and
 	 * hand every new task the head of its level. */
@@ -1515,6 +1638,39 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(soryu_init)
 void BPF_STRUCT_OPS(soryu_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
+}
+
+/*
+ * The feeder hook. i915_request_add fires in the context of the task doing
+ * the submitting, so current is the task we want.
+ *
+ * Kernel threads are skipped: i915 submits its own requests from workers
+ * (heartbeats, retires, display), and a kworker that once touched the ring is
+ * not a frame feeder. A task scx has not initialised yet has no tctx and is
+ * skipped too.
+ *
+ * The tracepoint lives in i915's module BTF. The loader turns this program
+ * off when /sys/kernel/btf/i915 is absent -- the test VM, the AMD machines --
+ * so the scheduler still loads there, with no feeders and gpu_boost_cap
+ * inert. The request pointer is never dereferenced, which is also why it is
+ * typed void: nothing here depends on i915's layout.
+ */
+SEC("tp_btf/i915_request_add")
+int BPF_PROG(soryu_i915_request_add, void *rq)
+{
+	struct task_struct *p = bpf_get_current_task_btf();
+	struct task_ctx *tctx;
+
+	if (!p || (p->flags & PF_KTHREAD))
+		return 0;
+
+	tctx = lookup_task_ctx(p);
+	if (tctx)
+	{
+		tctx->gpu_submit_at = scx_bpf_now();
+		stat_inc(SORYU_STAT_GPU_SUBMIT);
+	}
+	return 0;
 }
 
 SCX_OPS_DEFINE(soryu_ops,
