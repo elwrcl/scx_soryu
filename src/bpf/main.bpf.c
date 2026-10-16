@@ -1550,15 +1550,29 @@ s32 BPF_STRUCT_OPS(soryu_init_task, struct task_struct *p,
 	return 0;
 }
 
-s32 BPF_STRUCT_OPS(soryu_cgroup_init, struct cgroup *cgrp,
-				   struct scx_cgroup_init_args *args)
+/*
+ * Sleepable, and never fatal.
+ *
+ * This used to return -ENOMEM when the storage could not be created, and an
+ * error from ops.cgroup_init ejects the scheduler. It did, at boot, once per
+ * boot on 7-11 Oct: "ops.cgroup_init() failed (-12)" while systemd was
+ * creating cgroups, then systemd restarted us 5 s later -- 5 s of EEVDF every
+ * boot. Non-sleepable, the create is a GFP_ATOMIC allocation, and that is the
+ * likeliest way for it to fail there; sleepable makes it GFP_KERNEL.
+ *
+ * And a missing cgrp_ctx is not worth an ejection anyway: cgrp_refresh() and
+ * ops.cgroup_set_weight both already treat it as "no weight known", so the
+ * cost is that one cgroup's tasks run at the neutral adjustment.
+ */
+s32 BPF_STRUCT_OPS_SLEEPABLE(soryu_cgroup_init, struct cgroup *cgrp,
+							 struct scx_cgroup_init_args *args)
 {
 	struct cgrp_ctx *cgc;
 
 	cgc = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0,
 							   BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!cgc)
-		return -ENOMEM;
+		return 0;
 
 	cgc->weight = args->weight;
 	__sync_fetch_and_add(&cgrp_gen, 1);
